@@ -1,5 +1,4 @@
 # vp-daily-report
-# vp-daily-report
 
 VP 日报自动化脚本，用于从指定 Excel 工作簿中读取日报所需数据，并输出两段可直接粘贴使用的文案：
 
