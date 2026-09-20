@@ -81,6 +81,11 @@ def parse_args() -> argparse.Namespace:
         type=dt.date.fromisoformat,
         help="直接指定目标日期 YYYY-MM-DD；不能与 run_date 同时使用。",
     )
+    parser.add_argument(
+        "--stdout-only",
+        action="store_true",
+        help="仅在终端显示文案，不写入 CSV 文件。",
+    )
     args = parser.parse_args()
     if args.run_date and args.target_date:
         parser.error("run_date 和 --target-date 只能指定一个")
@@ -373,6 +378,22 @@ class ReportBuilder:
         name = f"非G9L{metric}" if exclude_g9l else f"其他车型{metric}"
         return self.compare_getter(getter, name=name)
 
+    def has_prior_trend_value(self, scope: str, metric: str) -> bool:
+        scope_row = self._scope_rows[scope]
+        metric_row = None
+        for row in range(scope_row + 2, min(scope_row + 12, self._max_trend_row + 1)):
+            label = self.trend.get((row, 1))
+            if label is not None and str(label).strip() == metric:
+                metric_row = row
+                break
+        if metric_row is None:
+            raise ReportDataError(f"{SHEET_TREND} 的 {scope} 区块缺少指标：{metric}")
+        for col in range(2, self._max_trend_col + 1):
+            date = as_date(self.trend.get((scope_row + 1, col)))
+            if date is not None and date < self.target and to_num(self.trend.get((metric_row, col))) is not None:
+                return True
+        return False
+
     def build(self) -> tuple[str, str]:
         online = self.compare_getter(self.online_value, name="线上官渠潜客客流")
         traffic = self.compare_trend("全系", "客流")
@@ -392,6 +413,9 @@ class ReportBuilder:
         other_drives = self.compare_derived("试驾")
 
         orders = self.compare_trend("全系", "锁单")
+        g9l_orders = self.compare_trend(
+            "G9L", "锁单", allow_missing_current=True, allow_missing_baseline=True
+        )
         l03_orders = self.compare_trend("L03", "锁单")
         gx_orders = self.compare_trend("GX", "锁单")
         other_orders = self.compare_derived("锁单")
@@ -406,12 +430,25 @@ class ReportBuilder:
             if g9l_drives.current is not None and drives.current
             else None
         )
+        g9l_order_share = (
+            g9l_orders.current / orders.current
+            if g9l_orders.current is not None and orders.current
+            else None
+        )
         g9l_drive_label = self.config.label
         if g9l_drives.baseline_partial and self.config.baseline_mode == "average":
             g9l_drive_label = self.config.label.replace("日均", "有值日均")
             self.warnings.append(
                 f"G9L试驾对比周期仅 {g9l_drives.baseline_found}/{g9l_drives.baseline_expected} 天有值，按有值日均计算。"
             )
+        if (
+            g9l_orders.current is not None
+            and g9l_orders.rate is None
+            and not self.has_prior_trend_value("G9L", "锁单")
+        ):
+            g9l_order_vs = f"{self.target.month}/{self.target.day}首次有锁单数据，暂无历史周期可比"
+        else:
+            g9l_order_vs = fmt_vs(self.config.label, g9l_orders.rate)
 
         overview = (
             f"线上官渠潜客客流：官渠客流{trend_word(online.rate)}，VS {self.config.label}{fmt_pct(online.rate)}；\n\n"
@@ -427,8 +464,10 @@ class ReportBuilder:
             f"{fmt_vs(g9l_drive_label, g9l_drives.rate)}；"
             f"L03{fmt_pct(l03_drives.rate)}，GX{fmt_pct(gx_drives.rate)}，"
             f"其他车型合计{fmt_pct(other_drives.rate)}；\n\n"
-            f"锁单总量：全系锁单总量{fmt_num(orders.current)}，VS {self.config.label}{fmt_pct(orders.rate)}；"
-            f"其中 L03 净锁单{fmt_num(l03_orders.current)}台，{fmt_pct(l03_orders.rate)}；"
+            f"锁单总量：全系锁单总量{fmt_num(orders.current)}台，VS {self.config.label}{fmt_pct(orders.rate)}；"
+            f"其中 G9L 净锁单{fmt_num(g9l_orders.current)}台（占全系锁单比例{fmt_pct_value(g9l_order_share)}），"
+            f"{g9l_order_vs}；"
+            f"L03 净锁单{fmt_num(l03_orders.current)}台，{fmt_pct(l03_orders.rate)}；"
             f"GX 净锁单{fmt_num(gx_orders.current)}台，{fmt_pct(gx_orders.rate)}；"
             f"其他车型合计{fmt_num(other_orders.current)}台，{fmt_pct(other_orders.rate)}。"
         )
@@ -442,6 +481,11 @@ class ReportBuilder:
             )
 
         day = self.target.day
+        month_orders = to_num(self.month.get((3, 20)))
+        month_leads = to_num(self.daily.get((16, 4)))
+        month_conversion = (
+            month_orders / month_leads if month_orders is not None and month_leads else None
+        )
         model = (
             f"客流：{day}日客流{fmt_num(to_num(self.daily.get((4, 2))))}，"
             f"月累客流{fmt_num(to_num(self.daily.get((16, 2))))}，"
@@ -456,10 +500,10 @@ class ReportBuilder:
             f"月累环比{fmt_pct(to_num(self.daily.get((20, 13))), False)}，"
             f"月累同比{fmt_pct(to_num(self.daily.get((65, 13))), False)}\n"
             f"锁单：{day}日锁单{fmt_num(self.trend_value('全系', '锁单', self.target))}，"
-            f"月累锁单{fmt_num(to_num(self.month.get((3, 20))))}，"
+            f"月累锁单{fmt_num(month_orders)}，"
             f"月累环比{fmt_pct(to_num(self.month.get((3, 21))), False)}，"
             f"月累同比{fmt_pct(to_num(self.month.get((3, 22))), False)}\n"
-            f"转化率：月累转化率{fmt_pct_value(to_num(self.month.get((3, 23))))}，"
+            f"转化率：月累转化率{fmt_pct_value(month_conversion)}，"
             f"月累环比{fmt_pct(to_num(self.month.get((3, 24))), False)}，"
             f"月累同比{fmt_pct(to_num(self.month.get((3, 25))), False)}"
         )
@@ -516,12 +560,14 @@ def main() -> int:
         target = infer_target_date(args.workbook, args.run_date, args.target_date)
         builder = ReportBuilder(XlsxReader(args.workbook), target)
         overview, model = builder.build()
-        write_csv(args.output, target, builder.config, overview, model)
+        if not args.stdout_only:
+            write_csv(args.output, target, builder.config, overview, model)
     except (OSError, KeyError, ET.ParseError, ReportDataError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 1
 
-    print(f"输出：{args.output.resolve()}")
+    if not args.stdout_only:
+        print(f"输出：{args.output.resolve()}")
     for warning in builder.warnings:
         print(f"提示：{warning}", file=sys.stderr)
     print("\n概览解析-AI颜色版")
